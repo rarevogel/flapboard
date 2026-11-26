@@ -1,0 +1,11 @@
+node_modules/
+dist/
+android/build/
+android/assets/
+*.apk
+*.idsig
+*.jks
+*.scr
+windows/board.c
+linux/flapboard.html
+*.pdb

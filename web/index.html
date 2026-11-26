@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#141414">
+<title>Flapboard</title>
+<style>
+/*@FONTS*/
+html,body{margin:0;height:100%;background:#141414;overflow:hidden;font:15px/1.4 'FlapLatin',system-ui,sans-serif;color:#eee;-webkit-tap-highlight-color:transparent;user-select:none}
+canvas{display:block;touch-action:manipulation}
+#hint{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:rgba(0,0,0,.7);border:1px solid #444;padding:7px 14px;border-radius:99px;font-size:13px;transition:opacity .8s;pointer-events:none}
+#hint.gone{opacity:0}
+#panel{position:fixed;left:50%;bottom:0;transform:translate(-50%,105%);width:min(720px,100%);max-height:88vh;overflow:auto;background:rgba(22,22,22,.97);border:1px solid #3a3a3a;border-bottom:0;border-radius:16px 16px 0 0;padding:14px 18px 20px;transition:transform .25s;box-shadow:0 -10px 40px rgba(0,0,0,.6);box-sizing:border-box}
+#panel.on{transform:translate(-50%,0)}
+#panel h2{margin:0;font-size:20px;letter-spacing:.04em;font-weight:700}
+.top{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.top .sp{flex:1}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#aaa;letter-spacing:.04em;text-transform:uppercase}
+label.ck{flex-direction:row;align-items:center;gap:8px;text-transform:none;font-size:14px;color:#ddd;letter-spacing:0}
+select{background:#262626;color:#fff;border:1px solid #444;border-radius:8px;padding:8px 9px;font:inherit;font-size:15px;text-transform:none;letter-spacing:0}
+input[type=checkbox]{width:20px;height:20px;accent-color:#ffc53d}
+button{background:#2b2b2b;color:#fff;border:1px solid #4a4a4a;border-radius:99px;padding:7px 14px;font:inherit;cursor:pointer}
+.seg{display:flex;border:1px solid #444;border-radius:9px;overflow:hidden}
+.note{margin:14px 0 0;font-size:12px;color:#8a8a8a}
+[hidden]{display:none!important}
+.nsbox{margin-top:12px;padding:12px;border:1px solid #3d5a8a;border-radius:10px;background:rgba(30,60,120,.25)}
+.nsbox a{color:#ffc53d}
+input[type=password]{flex:1;min-width:0;background:#262626;color:#fff;border:1px solid #444;border-radius:8px;padding:8px 9px;font:inherit;font-size:15px;text-transform:none;letter-spacing:0}
+body.saver,body.saver canvas{cursor:none}
+body.saver #hint{display:none}
+</style>
+</head>
+<body>
+<canvas id="board" aria-label="Departure board"></canvas>
+<div id="hint">Tap the board for settings</div>
+<div id="panel" role="dialog" aria-label="Settings">
+  <div class="top"><h2>Flapboard</h2><span class="sp"></span><button id="rollNow">↻ Roll the board</button><button id="full">⛶ Full screen</button><button id="close" aria-label="Close">✕</button></div>
+  <div class="grid">
+    <label>Board<select id="kind"><option value="train">🚆 Trains</option><option value="air">✈ Flights</option><option value="ns">🇳🇱 NS live (Netherlands)</option></select></label>
+    <label>Show<select id="dir"><option value="dep">Departures</option><option value="arr">Arrivals</option></select></label>
+    <label id="countryRow">Country<select id="country"></select></label>
+    <label>Writing<select id="lang"><option value="local" id="langLocal">Local</option><option value="latin" id="langLatin">Latin</option><option value="alt">Alternate both</option></select></label>
+    <label id="altRow">Switch every<select id="altSec"><option value="10">10 seconds</option><option value="20">20 seconds</option><option value="30">30 seconds</option><option value="60">1 minute</option></select></label>
+    <label>Look<select id="theme"><option value="classic">Classic black</option><option value="amber">Airport amber</option><option value="blue">Station blue</option><option value="green">Green</option><option value="white">White flaps</option></select></label>
+    <label>Flaps<select id="speed"><option value="slow">Slow</option><option value="normal">Normal</option><option value="fast">Fast</option></select></label>
+    <label>Rows<select id="rows"><option value="0">Fit the screen</option><option value="4">4</option><option value="6">6</option><option value="8">8</option><option value="10">10</option><option value="12">12</option><option value="16">16</option><option value="20">20</option></select></label>
+    <label>Roll all flaps<select id="rollS"><option value="0">Only when something changes</option><option value="10">Every 10 seconds</option><option value="20">Every 20 seconds</option><option value="30">Every 30 seconds</option><option value="60">Every minute</option><option value="120">Every 2 minutes</option><option value="300">Every 5 minutes</option><option value="600">Every 10 minutes</option><option value="1800">Every 30 minutes</option></select></label>
+    <label>Wear<select id="wear"><option value="off">Like new</option><option value="worn">Well used: tired flaps, faded tiles, a dead lamp</option></select></label>
+    <label>Frame<select id="frame"><option value="none">None</option><option value="alu">Aluminium</option><option value="wood">Wood</option></select></label>
+    <label>Surprise me<select id="random"><option value="off">Off</option><option value="country">Another country at every roll</option><option value="look">Another country and look</option><option value="all">Everything: country, look, trains/flights, writing</option></select></label>
+    <label id="orientRow">Screen<select id="orient"><option value="auto">Rotate freely</option><option value="landscape">Always landscape</option><option value="portrait">Always portrait</option></select></label>
+  </div>
+  <div id="nsBox" class="nsbox" hidden>
+    <div class="grid">
+      <label>NS station<select id="nsStation"></select></label>
+      <label>Your NS API key<span style="display:flex;gap:6px"><input id="nsKey" type="password" autocomplete="off" spellcheck="false" placeholder="Primary key"><button id="nsSave">Save</button></span></label>
+    </div>
+    <p class="note" style="margin-top:8px"><span id="nsState"></span> Live departures and arrivals from NS, refreshed every 30 seconds. The key is free: make an account at <a href="https://apiportal.ns.nl/" target="_blank" rel="noopener">apiportal.ns.nl</a>, subscribe to the product <b>Ns-App</b>, and copy its primary key here. It is kept on this device only.</p>
+  </div>
+  <div class="grid" style="margin-top:12px">
+    <label class="ck"><input type="checkbox" id="sound"> Flap sound</label>
+    <label class="ck"><input type="checkbox" id="colour"> Coloured remarks</label>
+    <label class="ck"><input type="checkbox" id="caps"> Capitals (where the script has them)</label>
+  </div>
+  <p class="note">"Surprise me" picks something new at every roll: the automatic one (set "Roll all flaps"), the Roll button, and each time the screensaver starts.</p>
+  <p class="note">Stations, airports, train types and airlines are real; the services, times, delays and gates are made up on the spot, and change during the day as on a real board. It is not live information.</p>
+</div>
+<script>
+/*@SCRIPT*/
+</script>
+</body>
+</html>

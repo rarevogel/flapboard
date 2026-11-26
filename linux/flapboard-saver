@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Flapboard screensaver for Linux (X11 desktops such as Linux Mint Cinnamon, MATE, Xfce).
+
+Runs quietly in the background. After the computer has been idle for a few minutes it shows the
+split-flap board full screen in a browser in kiosk mode (with its own profile, so your normal browser
+is untouched), and closes it as soon as you move the mouse or press a key.
+
+  flapboard-saver                 run in the background (started automatically at login after install.sh)
+  flapboard-saver --now           show the board now (to try it)
+  flapboard-saver --settings      open the board with its settings: what you choose there is what the screensaver shows
+  flapboard-saver --minutes 10    idle time before the board appears (saved)
+  flapboard-saver --browser PATH  use this browser (saved); default: the first of Chromium, Chrome, Brave, Edge, Vivaldi, Firefox
+"""
+import argparse, configparser, ctypes, ctypes.util, http.server, os, shutil, signal, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
+
+HOME = os.path.expanduser('~')
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.join(HOME, '.local', 'share')), 'flapboard')
+CONF = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.join(HOME, '.config')), 'flapboard', 'saver.conf')
+HTML = os.path.join(DATA, 'flapboard.html')
+PROFILE = os.path.join(DATA, 'browser-profile')
+PORT = 47815
+NS_BASE = os.environ.get('FLAPBOARD_NS_BASE', 'https://gateway.apiportal.ns.nl/')
+CHROMES = ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'brave-browser', 'microsoft-edge', 'microsoft-edge-stable', 'vivaldi-stable', 'vivaldi']
+
+
+def load_conf():
+    c = configparser.ConfigParser(); c.read(CONF)
+    s = c['saver'] if 'saver' in c else {}
+    return {'minutes': float(s.get('minutes', 5)), 'browser': s.get('browser', 'auto')}
+
+
+def save_conf(conf):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    c = configparser.ConfigParser(); c['saver'] = {k: str(v) for k, v in conf.items()}
+    with open(CONF, 'w') as f: c.write(f)
+
+
+def find_browser(pref):
+    if pref and pref != 'auto':
+        return pref if os.path.isfile(pref) else shutil.which(pref)
+    for b in CHROMES + ['firefox']:
+        p = shutil.which(b)
+        if p: return p
+    return None
+
+
+def is_firefox(path): return 'firefox' in os.path.basename(path)
+
+
+def url(query):
+    return f'http://127.0.0.1:{PORT}/flapboard.html?{query}'
+
+
+# ---- a tiny local web server: serves the board, and relays live NS requests (the browser may not ask NS directly)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def send(self, code, body, ctype):
+        self.send_response(code); self.send_header('Content-Type', ctype); self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store'); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        if u.path in ('/', '/flapboard.html', '/index.html'):
+            with open(HTML, 'rb') as f: return self.send(200, f.read(), 'text/html; charset=utf-8')
+        if u.path.startswith('/ns/'):
+            q = urllib.parse.parse_qsl(u.query); key = dict(q).get('key', '')
+            rest = urllib.parse.urlencode([(k, v) for k, v in q if k != 'key'])
+            req = urllib.request.Request(NS_BASE + u.path[4:] + ('?' + rest if rest else ''), headers={'Ocp-Apim-Subscription-Key': key, 'Accept': 'application/json', 'User-Agent': 'Flapboard'})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r: return self.send(r.status, r.read(), 'application/json')
+            except urllib.error.HTTPError as e: return self.send(e.code, e.read() or b'{}', 'application/json')
+            except Exception: return self.send(502, b'{}', 'application/json')
+        self.send(404, b'not found', 'text/plain')
+
+
+def serve():
+    """Start the local server in the background; False if another Flapboard process already serves it."""
+    try:
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
+    except OSError:
+        return False
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return True
+
+
+def command(browser, kiosk):
+    os.makedirs(PROFILE, exist_ok=True)
+    if is_firefox(browser):
+        return [browser, '--no-remote', '--profile', PROFILE] + (['--kiosk'] if kiosk else ['--new-window']) + [url('saver=1' if kiosk else 'settings=1')]
+    common = [f'--user-data-dir={PROFILE}', '--no-first-run', '--no-default-browser-check', '--noerrdialogs', '--disable-session-crashed-bubble',
+              '--hide-crash-restore-bubble', '--disable-features=Translate', '--password-store=basic']
+    if kiosk:
+        return [browser, '--kiosk', '--autoplay-policy=no-user-gesture-required', '--start-fullscreen'] + common + [url('saver=1')]
+    return [browser, f'--app={url("settings=1")}', '--window-size=1280,760'] + common
+
+
+# ---- idle time from the X server (XScreenSaver extension), no extra packages needed
+class XSSInfo(ctypes.Structure):
+    _fields_ = [('window', ctypes.c_ulong), ('state', ctypes.c_int), ('kind', ctypes.c_int),
+                ('til_or_since', ctypes.c_ulong), ('idle', ctypes.c_ulong), ('eventMask', ctypes.c_ulong)]
+
+
+class Idle:
+    def __init__(self):
+        self.ok = False
+        try:
+            x11 = ctypes.CDLL(ctypes.util.find_library('X11') or 'libX11.so.6')
+            xss = ctypes.CDLL(ctypes.util.find_library('Xss') or 'libXss.so.1')
+            x11.XOpenDisplay.restype = ctypes.c_void_p; x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong; x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(XSSInfo)
+            xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XSSInfo)]
+            self.dpy = x11.XOpenDisplay(None)
+            if not self.dpy: return
+            self.root = x11.XDefaultRootWindow(self.dpy); self.info = xss.XScreenSaverAllocInfo(); self.xss = xss; self.ok = True
+        except OSError:
+            pass
+
+    def ms(self):
+        if self.ok and self.xss.XScreenSaverQueryInfo(self.dpy, self.root, self.info):
+            return self.info.contents.idle
+        try:   # fallback: the xprintidle tool, if installed
+            return int(subprocess.run(['xprintidle'], capture_output=True, text=True, timeout=2).stdout.strip())
+        except Exception:
+            return None
+
+
+def inhibited():
+    """True while a video player or presentation asks the desktop not to start a screensaver."""
+    for dest, path, iface in (('org.gnome.SessionManager', '/org/gnome/SessionManager', 'org.gnome.SessionManager'),
+                              ('org.cinnamon.SessionManager', '/org/gnome/SessionManager', 'org.gnome.SessionManager')):
+        try:
+            r = subprocess.run(['gdbus', 'call', '--session', '--dest', dest, '--object-path', path, '--method', iface + '.IsInhibited', '8'],
+                               capture_output=True, text=True, timeout=2)
+            if r.returncode == 0: return 'true' in r.stdout
+        except Exception:
+            pass
+    return False
+
+
+def show_board(browser, idle, grace=2.0):
+    proc = subprocess.Popen(command(browser, True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    t0 = time.time()
+    try:
+        while True:
+            time.sleep(.15)
+            if time.time() - t0 < grace: continue
+            ms = idle.ms()
+            if ms is not None and ms < 600: break          # a key or the mouse: wake up
+            if proc.poll() is not None and time.time() - t0 > 20: break
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            for _ in range(20):
+                if proc.poll() is not None: break
+                time.sleep(.1)
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Flapboard screensaver')
+    ap.add_argument('--now', action='store_true'); ap.add_argument('--settings', action='store_true')
+    ap.add_argument('--minutes', type=float); ap.add_argument('--browser')
+    a = ap.parse_args()
+    conf = load_conf()
+    if a.minutes is not None or a.browser:
+        if a.minutes is not None: conf['minutes'] = a.minutes
+        if a.browser: conf['browser'] = a.browser
+        save_conf(conf); print(f"Saved: board after {conf['minutes']:g} minutes, browser {conf['browser']}")
+        if not (a.now or a.settings): return
+    if not os.path.isfile(HTML): sys.exit(f'{HTML} is missing: run install.sh first')
+    browser = find_browser(conf['browser'])
+    if not browser: sys.exit('No browser found: install Chromium (sudo apt install chromium) or Firefox')
+    own = serve()
+    if a.settings:
+        p = subprocess.Popen(command(browser, False), start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if own: p.wait()          # keep serving the board while the settings window is open
+        return
+    idle = Idle()
+    if idle.ms() is None: sys.exit('Cannot read the idle time (this needs an X11 session; on Wayland install xprintidle or use the X11 session)')
+    if a.now:
+        show_board(browser, idle); return
+    limit = conf['minutes'] * 60000
+    while True:
+        time.sleep(2)
+        ms = idle.ms()
+        if ms is None or ms < limit: continue
+        if inhibited(): continue
+        show_board(browser, idle)
+        conf = load_conf(); limit = conf['minutes'] * 60000; browser = find_browser(conf['browser']) or browser
+
+
+if __name__ == '__main__':
+    main()
